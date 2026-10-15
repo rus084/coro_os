@@ -1,0 +1,56 @@
+#ifndef CORO_FRAME_SLOT_INCLUDED
+#define CORO_FRAME_SLOT_INCLUDED
+#include <coro/frame>
+
+namespace coro {
+namespace detail {
+template<__SIZE_TYPE__... Values>
+consteval __SIZE_TYPE__ max_frame_value() {
+  __SIZE_TYPE__ result = 1;
+  ((result = result < Values ? Values : result), ...);
+  return result;
+}
+
+// Compare template identities without forming runtime function-pointer expressions.
+template<auto Function> struct frame_function_tag {};
+} // namespace detail
+
+// Storage for one live coroutine selected from a fixed set of functions.
+template<auto... Functions> class frame_slot {
+  static_assert(sizeof...(Functions) != 0,
+                "coro::frame_slot requires at least one function");
+  static_assert((detail::supported_frame_function<decltype(Functions)>::value && ...),
+                "coro::frame_slot requires functions returning coro::task<T>");
+public:
+  static constexpr __SIZE_TYPE__ capacity =
+      detail::max_frame_value<__builtin_coro_frame_size(Functions)...>();
+  static constexpr __SIZE_TYPE__ alignment =
+      detail::max_frame_value<__builtin_coro_frame_align(Functions)...>();
+private:
+  alignas(alignment) unsigned char storage[capacity]{};
+  bool occupied = false;
+public:
+  constexpr frame_slot() noexcept = default;
+  frame_slot(const frame_slot &) = delete;
+  frame_slot(frame_slot &&) = delete;
+  frame_slot &operator=(const frame_slot &) = delete;
+  frame_slot &operator=(frame_slot &&) = delete;
+  ~frame_slot() {
+    if (occupied) __builtin_trap();
+  }
+
+  template<auto Function, class... Args>
+    requires ((__is_same(detail::frame_function_tag<Function>,
+                         detail::frame_function_tag<Functions>)) || ...)
+  auto invoke(Args&&... args) noexcept
+      -> decltype(__builtin_coro_invoke(Function, static_cast<void *>(nullptr),
+                                       static_cast<bool *>(nullptr),
+                                       static_cast<Args&&>(args)...)) {
+    if (occupied) __builtin_trap();
+    occupied = true;
+    return __builtin_coro_invoke(Function, static_cast<void *>(storage), &occupied,
+                                 static_cast<Args&&>(args)...);
+  }
+};
+} // namespace coro
+#endif

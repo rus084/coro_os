@@ -1,0 +1,150 @@
+Coro OS: three jobs with nested blink_once, 2026-10-14
+
+Compiler: supplied noalloc Clang 23.1.3. Thumb Cortex-M0 / Cortex-M3.
+No LTO or section GC. Sources: noalloc_blink.cpp, cortex_m_loop.cpp and
+measurement-only startup/memory support. Board types shared in examples/board.hpp.
+This is a link-only image without real board startup, vector table or drivers.
+
+FLASH: actual objcopy binary size, including section alignment
+Optimization       Cortex-M0        Cortex-M3
+-O0                    9524             9368 bytes
+-O2                    2760             2968 bytes
+-Os                    2556             2508 bytes
+
+Linked contributions at -Os (not raw .o size; excludes discarded duplicates)
+Object/section      Cortex-M0        Cortex-M3
+application.o          1590             1544
+cortex_m_loop.o         794              792
+support.o                76               74
+.text padding             8                8
+.ARM.exidx               88               88
+inter-section pad         0                2
+TOTAL                  2556             2508 bytes
+
+Template scheduler code is instantiated inside application.o/cortex_m_loop.o;
+there is no separate scheduler.o. application.o includes the four coroutine
+resume/destroy paths, job/start code, notification handler and shared methods.
+
+RAM OBJECTS: both targets, -Os
+Static storage:
+blink_frame              76 bytes (includes nested blink_once frame)
+worker_frame             40
+irq_frame                44
+led_state                 4
+work_count                4
+hardware_endpoint         4
+ticks                     4
+active instance pointer   4
+singleton registry flag   1
+section alignment         3
+TOTAL .bss              184 bytes; initialized .data = 0
+
+Persistent automatic storage inside run_application:
+scheduler                20
+background job           40 (node 36 + owning task 4)
+receiver job             40
+blinker job              40
+peer endpoint             4
+TOTAL objects           144 bytes
+
+Object storage total: 184 + 144 = 328 bytes.
+The generated run_application stack frame is 152 bytes for M0/M3 at -Os,
+including these 144 bytes plus saved-register/alignment overhead.
+Baseline live RAM: 184 + 152 = 336 bytes, before additional call/IRQ stack.
+This is NOT a measured worst-case RAM/stack bound: board ISR nesting and
+peripheral-driver calls are not included, and no board execution was done.
+Heap use: none. Coroutines share the main execution stack, without per-task stacks.
+
+Size metadata object (not linked into firmware):
+sizeof(scheduler<ports::cortex_m::port>) = 20
+sizeof(job<coro::task<void>, ports::cortex_m::port>) = 40
+sizeof(detail::node<ports::cortex_m::port>) = 36
+sizeof(coro::task<void>) = 4 (already included in job)
+sizeof(notification_endpoint<ports::cortex_m::port>) = 4
+sizeof(ports::cortex_m::port) = 1, but its member adds 0 bytes via no_unique_address
+
+Nested-call support uses root/active/link fields in every promise
+(12 bytes on ARM). blink now awaits blink_once, whose storage lives inside
+blink_frame. The child uses the same blinker job and does not add another node.
+Root link stores the job context; child link stores the parent continuation.
+Scheduler dispatch uses the singleton; its removed bookkeeping saved16 bytes.
+Removing node.owner saved4 bytes per job. Compact flags and one ready/timer
+link saved another12 bytes per job. The compact change adds52/60 bytes Os
+flash (M0/M3) versus the preceding node48 layout, including guarded IRQ flags.
+
+ARM node36 layout (offset:size):
+queue_next 0:4, pending_next 4:4, pending_prev 8:4, delta 12:4,
+status 16:1, in_ready 17:1, in_timer 18:1, irq flags 19:1,
+task 20:4, resume 24:4, done 28:4, result/wait union 32:4.
+Ready/timer flags are thread-only byte fields. The separate IRQ byte contains
+in_pending/token/accepts_signals/wake_requested and is accessed under the port critical guard.
+
+Raw measurement outputs/maps: build-size-singleton/*/firmware.map,
+build-size-singleton/*/symbols.txt and build-size-singleton/measurement.log.
+
+Separate nested.cpp frame_slot comparison, Cortex-M0 -Os (not linked above):
+receive_packet returns received_packet; process_packet accepts it by value.
+frame<receive_packet> = 48 bytes
+frame<process_packet> = 40 bytes
+frame_slot<receive_packet, process_packet> = 48 bytes
+parent frame with shared slot = 100 bytes
+parent frame with two separate child frames = 140 bytes
+Measured via build-nested-arm/slot_layout.o; savings = 40 bytes per parent.
+task<T> has the same one-handle descriptor size as task<void>; its promise adds
+result storage, an initialization flag and alignment. The main void-task
+example's Os image, BSS and frame sizes are unchanged by typed result support.
+
+Linked nested.cpp example with a measurement-only one-job entry, 2026-10-14:
+The nested.o TU includes examples/nested.cpp and a small start_nested factory.
+entry.o constructs one scheduler/job, publishes its IRQ endpoint and enters the
+same cortex_m_loop. Startup/memory support is identical to the blink image.
+These are measurement fixtures, not an implemented board startup/vector table.
+
+FLASH                      Cortex-M0        Cortex-M3
+-O0                            10524            10388 bytes
+-O2                             2492             2700 bytes
+-Os                             2364             2332 bytes
+
+Linked contributions -Os:
+nested.o                         872              868
+entry.o                          554              522
+cortex_m_loop.o                  794              792
+support.o                         76               74
+.text padding                      4               10
+.ARM.exidx                        64               64
+inter-section padding              0                2
+TOTAL                           2364             2332 bytes
+
+RAM -Os, same for M0/M3:
+nested_parent_frame              100 bytes (contains shared child slot48)
+hardware_endpoint                  4
+ticks                              4
+active scheduler pointer           4
+singleton registry flag            1
+section alignment                  3
+TOTAL .bss                       116; initialized .data=0
+
+Persistent automatic objects: scheduler20 + one job40 =60 bytes.
+run_application static stack frame64 bytes includes those60 bytes.
+Object storage total116+60=176; base live RAM116+64=180 bytes, before deeper
+calls/IRQ. Neither image's base is a measured worst-case stack bound.
+Raw outputs/maps: build-size-examples/nested/* and measurement.log.
+
+Mutex/semaphore support, 2026-10-14:
+Shared poll supports primitive wakeups and semaphore timeout cancellation.
+Compared with the preceding images, -Os flash grows by116/96 bytes (M0/M3);
+the existing examples' RAM and coroutine frame sizes remain unchanged.
+The images above do not instantiate mutex/semaphore; their primitive-specific
+code and data are not included in these flash totals.
+
+Measured ARM objects (M0, same 32-bit layout used on M3):
+mutex<Port>                         12 bytes
+semaphore<Port,8>                   16
+mutex::guard                        8
+mutex::lock_awaiter                 24 (includes wait_record20)
+semaphore::acquire_awaiter          28 (includes wait_record20 and delay4)
+semaphore::timed acquire_awaiter    28
+wait_record                        20
+Awaiters are stored inside coroutine frames while suspended; these are object
+sizes, not additive predictions of final optimized frame sizes.
+Metadata: build-nested-arm/sync_layout.cpp and sync_layout.o.

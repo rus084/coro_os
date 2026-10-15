@@ -1,0 +1,218 @@
+#ifndef CORO_TASK_INCLUDED
+#define CORO_TASK_INCLUDED
+
+#if __has_include(<new>)
+#include <new>
+#else
+// Placement construction only; this overload never allocates memory.
+[[gnu::always_inline]] inline void *operator new(__SIZE_TYPE__, void *location) noexcept {
+  return location;
+}
+#endif
+
+#if __has_include(<coroutine>)
+#include <coroutine>
+#else
+// Minimal coroutine protocol for a freestanding target without a C++ sysroot.
+namespace std {
+template<class R, class... Args> struct coroutine_traits {
+  using promise_type = typename R::promise_type;
+};
+template<class Promise = void> struct coroutine_handle;
+template<> struct coroutine_handle<void> {
+  void *pointer = nullptr;
+  static constexpr coroutine_handle from_address(void *p) noexcept { return {p}; }
+  constexpr void *address() const noexcept { return pointer; }
+  constexpr explicit operator bool() const noexcept { return pointer != nullptr; }
+  bool done() const { return __builtin_coro_done(pointer); }
+  void resume() const { __builtin_coro_resume(pointer); }
+  void destroy() const { __builtin_coro_destroy(pointer); }
+};
+template<class Promise> struct coroutine_handle : coroutine_handle<void> {
+  static coroutine_handle from_promise(Promise &promise) noexcept {
+    return {{__builtin_coro_promise(&promise, alignof(Promise), true)}};
+  }
+  static constexpr coroutine_handle from_address(void *p) noexcept { return {{p}}; }
+  Promise &promise() const noexcept {
+    return *static_cast<Promise *>(
+        __builtin_coro_promise(this->pointer, alignof(Promise), false));
+  }
+};
+struct suspend_always {
+  bool await_ready() const noexcept { return false; }
+  void await_suspend(coroutine_handle<>) const noexcept {}
+  void await_resume() const noexcept {}
+};
+} // namespace std
+#endif
+
+namespace coro {
+namespace detail {
+// Shared across all task<T> promise types in a mixed-result call chain.
+struct task_promise_base {
+  task_promise_base *root = nullptr;
+  std::coroutine_handle<> active{};
+  // Root: scheduler context. Child: address of its parent continuation.
+  void *link = nullptr;
+  void *context() const noexcept { return root ? root->link : nullptr; }
+  std::suspend_always initial_suspend() noexcept { return {}; }
+  struct final_awaiter {
+    bool await_ready() const noexcept { return false; }
+    template<class Promise>
+    void await_suspend(std::coroutine_handle<Promise> self) const noexcept {
+      auto &promise = self.promise();
+      promise.root->active = promise.root == &promise
+          ? std::coroutine_handle<>{}
+          : std::coroutine_handle<>::from_address(promise.link);
+    }
+    void await_resume() const noexcept {}
+  };
+  final_awaiter final_suspend() noexcept { return {}; }
+  void unhandled_exception() noexcept { __builtin_trap(); }
+};
+
+template<class T> struct task_result {
+  static_assert(!__is_reference(T) && !__is_array(T) && !__is_const(T) && !__is_volatile(T),
+                "coro::task<T> requires an unqualified non-array object result");
+  static_assert(__is_nothrow_constructible(T, T&&),
+                "coro::task<T> requires a noexcept move constructor");
+  static_assert(noexcept(static_cast<T*>(nullptr)->~T()),
+                "coro::task<T> requires a noexcept destructor");
+  union { unsigned char empty; T value; };
+  bool has_value = false;
+  task_result() noexcept : empty{} {}
+  ~task_result() { if (has_value) value.~T(); }
+  template<class U>
+  void construct_result(U&& result) noexcept {
+    static_assert(__is_nothrow_constructible(T, U&&),
+                  "co_return must construct its result without throwing");
+    ::new (static_cast<void*>(&value)) T(static_cast<U&&>(result));
+    has_value = true;
+  }
+  void return_value(T&& result) noexcept { construct_result(static_cast<T&&>(result)); }
+  template<class U>
+  void return_value(U&& result) noexcept { construct_result(static_cast<U&&>(result)); }
+  T take_result() noexcept {
+    if (!has_value) __builtin_trap();
+    return T(static_cast<T&&>(value));
+  }
+};
+template<> struct task_result<void> {
+  void return_void() noexcept {}
+};
+} // namespace detail
+
+template<class T = void> class task {
+public:
+  struct promise_type;
+private:
+  using handle_type = std::coroutine_handle<promise_type>;
+  handle_type handle{};
+  explicit task(handle_type value) noexcept : handle(value) {}
+
+public:
+  struct promise_type : detail::task_promise_base, detail::task_result<T> {
+    task get_return_object() noexcept {
+      return task(std::coroutine_handle<promise_type>::from_promise(*this));
+    }
+    static void *operator new(__SIZE_TYPE__) = delete;
+    static void operator delete(void *) = delete;
+  };
+
+  constexpr task() noexcept = default;
+  task(const task &) = delete;
+  task &operator=(const task &) = delete;
+  task(task &&other) noexcept : handle(other.handle) {
+    other.handle = handle_type{};
+  }
+  task &operator=(task &&other) noexcept {
+    if (this != &other) {
+      reset();
+      handle = other.handle;
+      other.handle = handle_type{};
+    }
+    return *this;
+  }
+  ~task() { reset(); }
+  explicit operator bool() const noexcept { return static_cast<bool>(handle); }
+  bool done() const noexcept { return !handle || handle.done(); }
+  void bind_context(void *context) noexcept {
+    if (!context || done()) __builtin_trap();
+    auto &promise = handle.promise();
+    if ((promise.root && promise.root != &promise) || promise.link)
+      __builtin_trap();
+    if (!promise.root) {
+      promise.root = &promise;
+      promise.active = handle;
+    }
+    promise.link = context;
+  }
+  bool resume() noexcept {
+    if (done())
+      return false;
+    auto &promise = handle.promise();
+    if (!promise.root) {
+      promise.root = &promise;
+      promise.active = handle;
+    }
+    if (promise.root != &promise || !promise.active)
+      __builtin_trap();
+    // A trampoline avoids coroutine musttail transfers unsupported by Cortex-M.
+    // A changed handle is a call/return; an unchanged one is an external wait.
+    do {
+      auto active = promise.active;
+      active.resume();
+      if (promise.active.address() == active.address())
+        break;
+    } while (promise.active);
+    return !done();
+  }
+  void reset() noexcept {
+    auto previous = handle;
+    handle = handle_type{};
+    if (previous)
+      previous.destroy();
+  }
+
+  class awaiter {
+    handle_type child;
+  public:
+    explicit awaiter(handle_type value) noexcept : child(value) {}
+    awaiter(const awaiter &) = delete;
+    awaiter &operator=(const awaiter &) = delete;
+    ~awaiter() { if (child) child.destroy(); }
+    bool await_ready() const noexcept {
+      if (!child) __builtin_trap();
+      return child.done();
+    }
+    template<class ParentPromise>
+      requires (__is_base_of(detail::task_promise_base, ParentPromise))
+    void await_suspend(std::coroutine_handle<ParentPromise> parent) noexcept {
+      auto &promise = child.promise();
+      // Only a fresh child can be joined; an already running tree cannot be rebound.
+      if (promise.root || !parent.promise().root)
+        __builtin_trap();
+      promise.root = parent.promise().root;
+      promise.link = parent.address();
+      promise.root->active = child;
+    }
+    T await_resume() noexcept {
+      auto previous = child;
+      child = {};
+      struct cleanup {
+        handle_type handle;
+        ~cleanup() { handle.destroy(); }
+      } destroy_after_result{previous};
+      if constexpr (!__is_same(T, void))
+        return previous.promise().take_result();
+    }
+  };
+  // The awaiter owns the child until completion or cancellation of the parent.
+  awaiter operator co_await() && noexcept {
+    auto previous = handle;
+    handle = {};
+    return awaiter(previous);
+  }
+};
+} // namespace coro
+#endif

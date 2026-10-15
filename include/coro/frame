@@ -1,0 +1,51 @@
+#ifndef CORO_FRAME_INCLUDED
+#define CORO_FRAME_INCLUDED
+#include <coro/task>
+
+namespace coro {
+namespace detail {
+template<class T> struct is_task { static constexpr bool value = false; };
+template<class T> struct is_task<task<T>> { static constexpr bool value = true; };
+template<class T> struct supported_frame_function {
+  static constexpr bool value = false;
+};
+template<class R, class... Args>
+struct supported_frame_function<R (*)(Args...)> {
+  static constexpr bool value = is_task<R>::value;
+};
+template<class R, class... Args>
+struct supported_frame_function<R (*)(Args...) noexcept>
+    : supported_frame_function<R (*)(Args...)> {};
+} // namespace detail
+
+template<auto F> class frame {
+  static_assert(detail::supported_frame_function<decltype(F)>::value,
+                "coro::frame requires a function returning coro::task<T>");
+  alignas(__builtin_coro_frame_align(F))
+  unsigned char storage[__builtin_coro_frame_size(F)]{};
+  bool occupied = false;
+
+public:
+  constexpr frame() noexcept = default;
+  frame(const frame &) = delete;
+  frame(frame &&) = delete;
+  frame &operator=(const frame &) = delete;
+  frame &operator=(frame &&) = delete;
+  ~frame() {
+    if (occupied)
+      __builtin_trap();
+  }
+  template<class... Args>
+  auto operator()(Args&&... args) noexcept
+      -> decltype(__builtin_coro_invoke(F, static_cast<void *>(nullptr),
+                                       static_cast<bool *>(nullptr),
+                                       static_cast<Args&&>(args)...)) {
+    if (occupied)
+      __builtin_trap();
+    occupied = true;
+    return __builtin_coro_invoke(F, static_cast<void *>(storage), &occupied,
+                                 static_cast<Args&&>(args)...);
+  }
+};
+} // namespace coro
+#endif

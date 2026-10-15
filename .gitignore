@@ -1,0 +1,7 @@
+build*/
+.superpowers/
+core
+core.*
+PROGRESS.md
+__pycache__/
+*.pyc

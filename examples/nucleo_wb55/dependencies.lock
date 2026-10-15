@@ -1,0 +1,5 @@
+CMSIS_5 2b7495b8535bdcb306dac29b9ded4cfb679d7e5c
+cmsis_device_wb cda2cb9fc4a5232ab18efece0bb06b0b60910083
+FreeRTOS-Kernel a8c9d351520d43bd94692361bd67b6d798985c98
+pyocd 0.45.1
+Keil.STM32WBxx_DFP 2.0.1
